@@ -1,178 +1,467 @@
-# Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases
+# Aurora
 
-## Abstract 
+## 1. Aurora 是什么
 
-**Amazon Aurora** 是亚马逊网络服务（AWS）提供的一种面向 **OLTP**（联机事务处理）工作负载的关系型数据库服务。本文详细介绍了 Aurora 的架构方案，并阐述了驱动该架构形成的各项设计考量。我们认为，在高吞吐量的数据处理任务中，系统的核心瓶颈（Constraint）已经从传统的**计算与存储**转移到了**网络连接**。为了应对这一挑战，Aurora 为关系型数据库引入了一种新颖的架构：其最显著的特点在于将 **redo log**的处理工作下推（Pushing）到一个专为 Aurora 定制的、具备横向扩展能力的多租户存储服务中。我们将论证这种设计不仅能有效降低网络流量，还能实现快速的崩溃恢复、无数据丢失的副本故障转移，以及具备容错与自愈能力的存储系统。随后，本文将描述 Aurora 如何利用一种高效的**异步方案**，在大量存储节点间就持久化状态达成共识（Consensus），从而规避了开销巨大且通信频繁（Chatty）的传统恢复协议。最后，基于 Aurora 在生产环境运行超过 18 个月的实践经验，我们分享了从客户身上学到的内容，即现代云原生应用对数据库层（Database Tier）的真实诉求与期待。
+Aurora 是 Amazon Web Services（AWS）面向 OLTP 工作负载设计的一套**云原生关系型数据库系统**。它不是简单地把 MySQL 或 PostgreSQL 放到云主机上运行，而是重新拆解了传统数据库内核与存储层之间的边界：查询处理、事务、锁、缓存、访问方法等仍保留在数据库实例侧，而 redo logging、持久化存储、崩溃恢复、备份恢复等能力被下沉到一个多租户、可扩展、跨 AZ 的分布式存储服务中。
 
-## Keywords
+Aurora 要解决的问题不是“SQL 怎么执行”，而是“在云上，关系型数据库怎样同时获得高吞吐、高可用、低恢复时间和较低运维复杂度”。传统数据库在云环境中使用网络存储时，写路径会把 redo log、binlog、脏页、double-write page、元数据等多类 I/O 反复写到网络和副本上。随着计算和本地磁盘能力提升，真正的瓶颈越来越不是 CPU，也不只是单盘吞吐，而是**网络 I/O 放大、跨可用区同步、尾延迟和故障恢复成本**。
 
-Databases; Distributed Systems; Log Processing; Quorum Models; Replication; Recovery; Performance; OLTP
+Aurora 的核心判断是：如果所有持久化 I/O 都必须跨网络，那么数据库系统就应该尽量减少跨网络传输的内容。它选择只把 redo log record 发送到存储层，由存储层异步、分布式地完成 page materialization、备份、修复、垃圾回收和校验。换句话说，Aurora 把“log is the database”这件事工程化：数据库实例写日志，分布式存储服务负责把日志变成可靠、可读、可恢复的数据面。
 
-## 1. INTRODUCTION
+因此，Aurora 的价值不只是“比普通 MySQL 更快”。更准确地说，它把关系型数据库变成了一个云服务体系：兼容主流关系数据库接口，同时让底层存储具备自动扩展、跨 AZ 复制、自修复、快速恢复和持续备份能力。
 
-IT 业务负载正加速向公有云服务商迁移。这一席卷全行业的转型，其核心原因在于云端能够提供灵活的**按需（On-demand）资源配置能力**，并将财务模型从传统的**资本支出（CapEx）转变为运营支出（OpEx）**。由于大量的 IT 工作负载都依赖于关系型 **OLTP** 数据库，因此，能否提供与本地部署（On-premise）环境对等、甚至更优越的数据库能力，是支撑这一历史性迁移趋势的关键。
+---
 
-在现代分布式云服务中，系统的**容错性（Resilience）与可扩展性**日益通过**计算与存储解耦（Decoupling compute from storage）以及跨多节点存储复制**来实现。这种设计使我们能够高效地处理各类运维操作，例如：更换行为异常或不可达的主机、增加副本、执行从写节点到副本的故障转移，以及对数据库实例进行垂直伸缩（升配或降配）等。
+## 2. 设计初衷：云上 OLTP 需要怎样的数据库系统
 
-在云原生环境下，传统数据库系统所面临的 **I/O 瓶颈**发生了本质上的改变。因为 I/O 操作可以被分散到由大量节点和磁盘构成的多租户集群（Fleet）中，单一磁盘或节点已不再是性能热点（Hotspot）。相反，瓶颈转移到了发起 I/O 请求的**数据库层**与执行 I/O 的**存储层**之间的网络连接上。除了每秒包转发率（PPS）和带宽等基础瓶颈外，高性能数据库为了追求效率，会向存储集群发起大规模的并行写入，这进一步导致了**流量放大（Amplification of traffic）**效应。在这种架构下，即便整体性能卓越，个别**离群（Outlier）**的存储节点、磁盘或网络路径的性能表现，也往往会决定最终的系统响应时间。
+Aurora 的背景是企业 OLTP 工作负载向公有云迁移。客户希望获得关系型数据库的事务语义、SQL 能力和生态兼容性，同时又希望云数据库具备弹性、托管、高可用和按需付费能力。传统数据库架构在这种环境中会暴露出几个系统性问题。
 
-尽管数据库中的大多数操作可以实现**并发执行**（overlap），但在某些特定场景下，**同步操作**（synchronous operations）仍是必不可少的。这些同步操作会导致系统出现**执行停顿**（stalls）以及频繁的**上下文切换**。一个典型的场景是：由于数据库**缓冲池**（buffer cache）未命中而触发的磁盘读取请求。在这种情况下，读取线程在数据读取完成前无法继续运行，从而进入阻塞状态。此外，缓存未命中还可能带来额外的性能开销（penalty），为了给新调入的页面腾出空间，系统必须**驱逐**（evicting）并**刷写**（flushing）现有的“脏”缓存页。虽然通过**检查点**（checkpointing）和**脏页写回**等后台处理机制可以有效降低上述开销的发生频率，但这些后台进程本身也可能诱发系统停顿、上下文切换以及**资源竞争**（resource contention）问题。
+第一，**网络成为主要约束**。在云上，存储通常是网络化、复制化、跨故障域部署的。一次用户写入会被数据库内核放大成多种写：redo log、数据页、double-write buffer、binlog、元数据等，再被高可用架构继续复制。I/O 的类型、顺序和同步点越多，网络带宽、PPS、跨 AZ 延迟和尾部抖动越容易成为瓶颈。
 
-**事务提交**是产生系统干扰的另一个主要来源。单个事务在提交过程中的**停顿**（stall）可能会产生连锁反应，进而阻碍其他事务的正常推进。在云规模（cloud-scale）分布式系统中，采用**二阶段提交**（2PC）等**多阶段同步协议**来处理提交操作面临着严峻挑战。这些协议对故障的容忍度极低，而在大规模分布式系统中，硬件与软件故障如同持续存在的“**背景噪声**”般不可避免。此外，由于大规模系统往往跨越多个数据中心进行分布式部署，此类协议还会引入显著的**高延迟**（latency）问题。
+第二，**可用性不能只按单节点故障设计**。在大规模云环境里，磁盘、节点、网络路径的小故障持续发生，AZ 级别的相关性故障也必须纳入模型。一个 3 副本、2/3 quorum 的设计看似能容忍单点故障，但如果某个 AZ 故障时其他 AZ 中正好存在后台修复中的副本，就可能丢失读 quorum 或写 quorum。
 
-![](../pic/aurora1.png)
+第三，**恢复时间必须从“离线事件”变成“在线常态”**。传统数据库崩溃后需要从 checkpoint 开始 replay WAL；checkpoint 间隔越长，恢复越慢，间隔越短，前台业务越容易被 checkpoint 干扰。Aurora 希望消除这个折中：存储层持续应用 redo log，使崩溃恢复不再依赖数据库启动时的大规模同步 replay。
 
-<center>图 1：Move logging and storage off the database engine</center>	
+第四，**客户仍然需要数据库兼容性**。Aurora 不是从零构建一个全新的 SQL 系统，而是在 MySQL/InnoDB 等成熟关系数据库内核基础上进行深度改造。这样可以保留 SQL、事务隔离、应用协议和运维习惯，同时把最适合云化的部分迁移到分布式存储层。
 
-本文介绍了 **Amazon Aurora**，这是一种全新的数据库服务。它通过在高度分布的云环境中更深层次地利用**重做日志**（redo log），有效地解决了前述问题。我们采用了一种创新的**面向服务的架构**（SOA，见图 1），其核心是一个支持**多租户**且具备**横向扩展**（scale-out）能力的存储服务。该服务抽象出了一种**虚拟化的分段重做日志**，并与数据库实例集群保持**松耦合**关系。尽管每个实例内部仍保留了传统数据库内核的大部分组件（包括查询处理器、事务管理、锁机制、缓冲池、访问方法以及 **undo 管理**），但诸如重做日志记录、持久化存储、崩溃恢复以及备份/恢复等关键功能，均已**卸载**（off-loaded）至专门的存储服务层。
+第五，**云数据库必须具备运维服务化能力**。这包括自动扩容、自动修复、持续备份、快速 failover、在线 DDL、软件升级，以及在多租户 SaaS 场景中处理大量连接、大量表和不可预测流量峰值。
 
-我们的架构相比传统方案具有三个显著优势：
+从这些要求出发，Aurora 的核心目标可以概括为：
 
-1. **首先，我们将存储构建为跨多个数据中心的独立、容错且具备自愈能力的服务。** 这种设计保护了数据库，使其免受网络或存储层**性能抖动**（performance variance）以及瞬时或永久性故障的影响。我们观察到：持久性（durability）故障可以建模为长时的可用性事件，而可用性事件又可以建模为长时的性能波动——一个设计良好的系统可以将这些问题进行统一化处理。
-2. **其次，通过仅向存储层写入重做日志（redo log）记录，我们将网络 IOPS 降低了一个数量级。** 在消除这一瓶颈后，我们得以对其他大量的**资源竞争点**（points of contention）进行激进优化。相比于我们最初基于的 MySQL 原生代码库，Aurora 在吞吐量上实现了质的飞跃。
-3. **最后，我们将一些最复杂且关键的功能（如备份和重做恢复）进行了转化。** 这些功能不再是数据库引擎中耗时且昂贵的一次性操作，而是转变为**平摊**（amortized）到大规模分布式集群中的持续异步操作。这使得系统无需**检查点**（checkpointing）即可实现近乎即时的崩溃恢复，并能在不干扰前台处理的情况下，实现低成本的备份。
+- **降低网络 I/O 放大**：只把必要的 redo log 写过网络。
+- **提高跨故障域可用性**：使用跨 3 个 AZ、6 副本、读写 quorum 的存储模型。
+- **缩短恢复时间**：把 redo apply 和 backup/restore 从一次性离线操作变成持续后台操作。
+- **保持关系数据库语义**：让上层仍然表现得像一个熟悉的 MySQL/PostgreSQL 兼容数据库。
+- **适配云服务运维**：自动扩展、自修复、监控、控制面编排和多租户资源管理。
 
-在本文中，我们将讲述三大核心贡献：
+---
 
-1. **云规模下的持久性建模与容灾设计**：探讨如何在云环境下审视持久性（durability），并设计能够抵御**相关性故障**（correlated failures）的 **Quorum（多数派）系统**。（第 2 节）
-2. **利用智能存储实现架构下推**：介绍如何通过将传统数据库的**底层组件（lower quarter）卸载（offloading）至存储层，从而充分发挥智能存储**的性能优势。（第 3 节）
-3. **简化分布式存储流程**：阐述如何在分布式存储中省去**多阶段同步协议**、**崩溃恢复**过程以及**检查点**（checkpointing）机制。（第 4 节）
+## 3. 设计理念：Aurora 为什么“成了”
 
-随后，我们将在第 5 节展示如何有机融合这三项核心理念，以构建 Aurora 的整体架构。第 6 节将对性能结果进行评估，第 7 节分享我们的实践经验与教训。最后，我们在第 8 节简要综述相关工作，并在第 9 节给出结论。
+### 3.1 先承认网络是瓶颈，而不是继续优化本地磁盘路径
 
-## 2. DURABILITY AT SCALE
+Aurora 的第一个关键判断是：在云环境中，数据库性能优化的中心不应继续停留在“本地页写得更快”，而应转向“减少跨网络写什么、写多少、同步多少次”。
 
-一个数据库系统即便不具备其他任何功能，也必须履行其最核心的约定：**数据一旦写入，即须确保可读。**然而，现实中并非所有系统都能完美兑现这一承诺。在本节中，我们将论述 **Quorum 模型**的设计初衷、实施**存储分段**（segmenting storage）的原因，以及这两者的结合如何在提升**持久性**、**可用性**并减少**性能抖动**（jitter）的同时，协助我们解决大规模存储集群管理中的**运维**（operational）难题。
+传统数据库把数据页、日志、double-write、binlog 等不同物理对象写出，本质上是在网络存储环境中重复表达同一份状态变化。Aurora 认为，事务提交真正需要持久化的是 redo log，而不是立即写出完整数据页。数据页可以稍后由存储层基于 redo chain 生成。
 
-### 2.1 Replication and Correlated Failures
+这个理念带来的结果是：**写路径从 page-centric 变成 log-centric**。Aurora 不再让数据库实例把页面写到存储服务；数据库实例只写 redo records，存储服务再把日志应用为页面。
 
-**数据库实例的生命周期与存储的生命周期之间并不存在强相关性。** 实例可能因故障而失效，用户也可能主动将其关闭，或是根据负载波峰波谷对其实例规格进行**扩缩容**（resize）。基于上述原因，将**存储层**与**计算层**进行**解耦**（decouple）具有极大的实际意义。
+### 3.2 把“存储”变成数据库感知的服务
 
-一旦实现了这一步（存算分离），存储节点和磁盘本身同样面临失效风险。因此，必须采用某种形式的**副本机制**（replicated），以增强系统对故障的**容错韧性**（resiliency）。在大规模云环境下，节点、磁盘及网络路径的故障如同一系列持续不断的低分贝“**背景噪声**”。这类故障的持续时间与**影响范围**（blast radius）各不相同。例如，节点可能遭遇瞬时的网络不可访问或因重启导致的短暂宕机；也可能发生磁盘、服务器节点、机架、**交换机**（leaf/spine switch）乃至整个数据中心的永久性故障。
+Aurora 的存储层不是普通块设备，也不是只负责复制 bit 的远端磁盘。它理解 redo log、LSN、page version、Protection Group、quorum、repair、backup 和 crash recovery。
 
-在多副本系统中，一种容忍故障的常用方法是采用基于 **Quorum 的投票协议**。假设为一个冗余数据项的 $V$ 个副本各分配一张选票，那么执行读操作或写操作时，必须分别获得包含 $V_r$ 张选票的“**读 Quorum**”或包含 $V_w$ 张选票的“**写 Quorum**”。为了实现一致性，这些 Quorum 必须遵循以下两条准则：
+这改变了数据库与存储的关系：
 
-1. **每次读操作必须能够感知到最近的一次写操作。** 该准则公式化表述为：
+- 数据库实例负责 SQL、事务、锁、缓存和并发控制；
+- 存储服务负责日志持久化、页面物化、备份、修复、校验和容量增长；
+- 控制面负责编排 failover、实例替换、存储卷元数据和长任务。
 
-   $$
-   V_r + V_w > V
-   $$
+这是一种典型的云原生拆分：不是把数据库整体塞进一个更大的机器，而是把数据库内核里最适合 scale-out 的部分变成服务。
 
-   这一规则确保了用于读取的节点集合与用于写入的节点集合必然存在**交集**，从而保证读 Quorum 中至少有一个位置存放着最新的版本。
-   
-2. **每次写操作必须能够感知到前一次写操作以避免写入冲突。** 该准则公式化表述为：
+### 3.3 用 quorum 承担故障模型，而不是依赖主备镜像
 
-   $$
-   V_w > V/2
-   $$
+传统主备镜像通常会形成强同步链路：主库写本地存储，再镜像到备库存储，再等待多个顺序步骤完成。Aurora 改用分布式 quorum：每个数据项 6 副本，分布在 3 个 AZ，每个 AZ 2 副本；写入等待 4/6，读取需要 3/6。
 
-为了应对单节点失效（Single Node Loss），业界通用的做法是将数据备份至 3 个节点：
+这个 quorum 选择有两个目的：
 
-$$
-V = 3
-$$
+1. 容忍 AZ 级相关故障和节点/磁盘级背景故障的叠加；
+2. 避免所有副本都必须同步完成，降低慢节点和尾延迟对提交路径的影响。
 
-并依赖于“2/3 写 Quorum”与“2/3 读 Quorum”机制，即：
+因此，Aurora 的复制不是“主库到备库”的线性复制，而是“数据库实例到存储 quorum”的并行复制。
 
-$$
-V_w = 2, \quad V_r = 2
-$$
+### 3.4 共识不是每次都做，而是让日志有序推进
 
-然而，我们认为 2/3 的 Quorum 配置并不能提供足够的保障。究其原因，需先剖析 AWS 中**可用区（Availability Zone，简称 AZ）**的概念。AZ 是地理区域（Region）内的逻辑子集，虽然各可用区之间通过低延迟链路互联，但在电力供应、网络架构、软件部署及自然灾害（如洪涝）等绝大多数故障风险维度上，AZ 之间是保持物理隔离的。
+Aurora 没有在每个事务提交上套用昂贵的 2PC。它利用 redo log 的天然顺序性：数据库为每条 log record 分配单调递增的 LSN，存储节点对各自 segment 的日志缺口进行 gossip 和补洞，数据库根据 write quorum 的 ACK 推进 Volume Durable LSN（VDL）。
 
-通过将数据副本跨可用区进行分布式存储，可以确保在大规模生产环境下，典型的故障模式仅会波及单一副本。这意味着，只要将三个副本分别部署在不同的可用区，系统不仅能有效容忍微观的单点故障，更能抵御影响范围更广的大规模灾难性事件。
+事务提交的关键条件不是“所有参与者同步完成一个复杂协议”，而是：该事务的 commit LSN 已经不超过当前 VDL。这样，提交确认可以由专门线程完成，工作线程不必阻塞等待某个事务的持久化结果，而是继续处理后续请求。
 
-然而，在规模庞大的存储集群（Storage Fleet）中，“背景故障噪声”的存在意味着在任何特定时刻，总会有部分磁盘或节点处于失效状态并处于修复流程中。这类故障通常独立分布在可用区 AZ 的 A、B 和 C 的各个节点上。此时，若 AZ 的 C 因火灾、机房损毁或洪涝等突发事件发生整区故障，对于那些在 AZ 的 A 或 AZ 的 B 中正巧存在并发故障副本的数据而言，其 Quorum 机制将会被彻底破坏。在这种情况下，以$$2/3$$ 读 Quorum 模型为例，由于我们实际上已经丢失了两个副本，系统将无法判断仅存的第三个副本是否包含了最新的数据状态。换言之，尽管各可用区内单个副本的失效是互不相关的随机事件，但**可用区级故障（AZ Failure）本质上是一种相关性故障（Correlated Failure）**，它会导致该区域内所有的磁盘和节点同时瘫痪。因此，健壮的 Quorum 机制必须具备同时容忍整区故障以及并发发生的常态化背景故障的能力。
+### 3.5 恢复不是宕机后的重活，而是后台持续工作
 
-在 Aurora 的研发中，我们确立了以下设计准则：
+传统数据库的崩溃恢复通常发生在重启时：扫描 WAL，重做 committed update，回滚未提交事务。Aurora 把 redo apply 下沉到存储层，让它持续、并行、异步执行。数据库重启时主要是重建运行时状态和确定各 Protection Group 的 durable point，而不是重新把大量 redo 同步应用到页面。
 
-1. 在丢失整个可用区（AZ）且额外增加一个节点失效（即 **AZ+1** 故障）的情况下，确保**数据不丢失**；
-2. 在丢失整个可用区的情况下，确保系统的**写入能力**不受影响。
+这体现了一个重要设计原则：**把前台不可预测的大任务，改造成后台持续摊销的小任务**。
 
-为了达成这一目标，我们将每项数据在 3 个可用区内进行 6 路复制（Replication），即每个可用区各存放 2 个副本。我们采用了具有 6 个投票权重的 Quorum 模型，其具体配置如下：
+### 3.6 兼容性是产品成功的边界条件
 
-$$
-V = 6, \quad V_w = 4, \quad V_r = 3
-$$
+Aurora 的架构改动很深，但它没有让应用面对一个陌生数据库。其设计保留了传统关系数据库的查询、事务隔离、缓存和访问方法，使存储服务对数据库引擎呈现出类似本地磁盘的抽象。这种“底层重构、上层兼容”的路线，是 Aurora 能被大量现有 OLTP 应用迁移采用的重要条件。
 
-在该模型下，我们可以实现：
+---
 
-- **(a) 高读取可用性**：即使面对单个可用区故障叠加一个额外节点失效（共计 3 个节点故障），系统依然能维持读取可用性（因剩余 3 个副本仍满足 $V_r=3$）。
-- **(b) 高写入可用性**：在任意两个节点失效（包括整个可用区级故障导致两个副本丢失）的情况下，系统依然能够维持写入可用性（因剩余 4 个副本仍满足 $V_w=4$）。
+## 4. 核心数据与状态模型：Redo Log、LSN、Segment、PG
 
-此外，只要能够确保读取 Quorum 的达成，我们便可以通过补齐额外的副本拷贝，来重新构建并恢复写入 Quorum。
+Dapper 的核心模型是 trace / span / annotation；Aurora 的核心模型则是 log / LSN / page / segment / Protection Group。
 
-### 2.2 Segmented Storage
+### 4.1 Redo log record
 
-接下来，我们需要探讨 $AZ+1$ 容错模型是否能提供充足的**持久性（Durability）**。在该模型下，若要确保数据万无一失，必须保证在修复单点故障的时间窗口内（即**平均修复时间MTTR**），由独立随机事件引发“双重故障”的概率（与**平均无故障时间MTTF** 相关）降至极低水平。如果双重故障发生的概率较高，一旦叠加可用区（AZ）级故障，系统的 Quorum 机制将会被彻底破坏。然而，在硬件层面进一步降低独立故障的发生率（提升 MTTF）往往存在物理瓶颈。因此，我们的设计核心转向了**缩短 MTTR**，以此来收缩系统处于双重故障威胁下的“**风险窗口**”（Window of Vulnerability）。
+当数据库修改一个页面时，并不必须立即把完整页面写出。它可以生成一条 redo log record，描述如何把页面的 before-image 变成 after-image。事务提交只要求相关 redo log 已经持久化，页面本身可以延迟物化。
 
-为了实现这一目标，我们将数据库卷（Volume）划分为固定大小的小型**数据分段（Segments）**，目前每个分段的大小设定为 **10GB**。这些分段以 6 副本模式组织为**保护组（Protection Groups, PGs）**；也就是说，每个 PG 由 6 个 10GB 的分段组成，跨 3 个可用区部署，且每个可用区各分布 2 个分段。从架构上看，一个逻辑存储卷是由一系列 PG 串联而成的集合。在物理实现上，这些分段部署在海量存储节点集群中，这些节点由挂载了 SSD 的 Amazon EC2 虚拟化主机组成。随着数据量的增长，系统会自动分配新的 PG。目前，在不计副本（原始容量）的情况下，我们支持单个存储卷扩展至 **64TB**。
+在 Aurora 中，跨网络写出的主要对象就是 redo log record。数据页不会因为 checkpoint、缓存淘汰或后台刷脏而从数据库实例写到存储层。存储层通过应用 redo log 来生成页面。
 
-**数据分段（Segment）**目前已成为我们应对独立背景噪声故障（Background Noise Failure）以及执行故障修复的基本单元。作为云服务的核心组成部分，我们会对故障进行实时监控并触发自动化修复流程。在 **10Gbps** 的网络链路下，修复一个 **10GB** 的分段仅需 **10 秒**。
+### 4.2 LSN：Log Sequence Number
 
-这意味着，只有当以下极端情况在同一个 10 秒的修复窗口内并发时，系统的 Quorum 机制才会被破坏：
+每条 log record 都有一个单调递增的 Log Sequence Number（LSN）。LSN 是 Aurora 判断日志顺序、完整性、可见性、提交点和恢复点的基础。
 
-1. **同时发生两次**独立的分段故障；
-2. 并且**叠加一个不包含**上述两个故障点的可用区（AZ）级故障。
+Aurora 依赖 LSN 维护多个关键状态：
 
-根据我们观测到的实际故障率，即便考虑到 Aurora 为客户管理着海量的数据库实例，这种多重故障并发的概率在统计学意义上也是极低的，足以忽略不计。
+- 某个 segment 已经连续接收并补齐到哪里；
+- 整个 volume 已经 durable 到哪里；
+- 某个事务的 commit LSN 是否已经可确认；
+- 读取某个页面时应读取哪个 read point；
+- 崩溃恢复时哪些日志应被保留，哪些应被截断。
 
-### 2.3 Operational Advantages of Resilience
+### 4.3 MTR 与 CPL
 
-一个能够天然抵御长期故障（Long Failures）的系统，必然也具备抵御短期故障的能力。例如，一个足以应对可用区（AZ）长期瘫痪的存储系统，同样能够从容处理因电力波动或软件部署失败（需执行回滚）所导致的短暂中断。同理，如果系统能容忍 Quorum 成员数秒钟的不可用，那么它自然也能化解瞬时的网络拥塞或存储节点的高负载压力。
+Aurora 沿用 InnoDB 中 mini-transaction（MTR）的概念。一个数据库级事务会拆分成多个必须原子执行的 MTR，每个 MTR 由连续的 log records 构成。每个 MTR 的最后一条 log record 被标记为 Consistency Point LSN（CPL）。
 
-由于我们的系统具备极高的故障容忍度，我们可以巧妙地利用这一特性来执行那些会导致数据分段（Segment）暂时不可用的运维操作。
+CPL 的作用是给 Aurora 一个安全的截断/恢复边界：系统不应该恢复到某个 MTR 的中间位置，而应该恢复到一个一致点。
 
-- **热点管理（Heat Management）**：其处理过程变得非常直观。我们可以将处于高负载（“热”）磁盘或节点上的某个分段标记为“坏损”，系统便会通过 Quorum 修复机制，迅速将其迁移至集群中负载较低的“冷”节点上。
-- **系统补丁（OS and Security Patching）**：对于正在执行补丁更新的存储节点而言，这仅被视为一次极短时间的不可用事件。
-- **软件升级（Software Upgrades）**：我们甚至以同样的方式管理存储集群的软件升级。升级过程按可用区（AZ）逐一顺序执行，并严格确保同一个保护组（PG）中同时处于升级状态的成员数不超过一个。
+### 4.4 VCL 与 VDL
 
-这种设计使我们能够在存储服务中引入**敏捷方法论（Agile Methodologies）并实现快速部署（Rapid Deployments）**。
+Aurora 会跟踪 volume 的完整性和持久性。
 
-## 3.THE LOG IS THE DATABASE
+- **VCL（Volume Complete LSN）**：可以理解为 volume 层面已完整接收的日志上界。
+- **VDL（Volume Durable LSN）**：不超过 VCL 的最高 CPL。VDL 是真正可作为 durable state 使用的边界。
 
-在本节中，我们将阐述为何在第 2 节所述的“分段式副本存储系统”上运行传统数据库，会导致在**网络 I/O** 与**同步停顿（Synchronous Stalls）**方面产生难以逾越的性能负担。
+事务提交判断与 VDL 直接相关：如果某个事务的 commit LSN 不大于当前 VDL，那么它可以被确认提交。
 
-随后，我们将介绍 Aurora 的核心方案：**将日志处理逻辑卸载（Offload）至存储服务层**，并结合实验数据证明该方案能够显著降低网络 I/O 开销。最后，我们将详细描述存储服务中所采用的各项关键技术，以最大程度地减少同步停顿及不必要的冗余写入。
+### 4.5 Segment 与 Protection Group
 
-### 3.1 The Burden of Amplied Writes
+Aurora 把数据库 volume 切成固定大小 segment。论文中的 segment 大小是 10GB。每个 segment 被复制 6 份，形成一个 Protection Group（PG），跨 3 个 AZ 分布，每个 AZ 2 份。
 
-我们的存储卷分段模型、6 路副本复制以及 $4/6$ 写 Quorum 机制共同赋予了系统极高的容错弹性。然而，对于像 MySQL 这样在处理单次应用层写入时会产生多种不同实际 I/O 操作的传统数据库而言，该模型引发的性能负担是难以承受的。
+一个 Aurora storage volume 可以看作多个 PG 的拼接。随着 volume 增长，系统分配新的 PG；当 segment 或节点故障时，系统以 segment 为单位修复，从而缩短 MTTR。
 
-多副本机制进一步放大了原本就已高企的 I/O 流量，给系统带来了沉重的**每秒数据包数（PPS）负担。此外，这些 I/O 操作还构成了诸多同步点（Points of Synchronization）**，不仅会导致执行流水线停顿（Stall），还会显著拉长延迟。尽管链式复制（Chain Replication）及其替代方案能够有效降低网络开销，但它们依然无法摆脱同步停顿和累加延迟的困扰。
+这种小 segment 设计的关键不只是容量管理，而是故障模型：如果修复粒度足够小，系统处在“副本不足但尚未修复”的脆弱窗口就足够短，从而降低叠加故障破坏 quorum 的概率。
 
-以 MySQL 为代表的系统，不仅需要将**数据页（Data Pages）写入其暴露的对象（如堆文件、B 树等），还需将重做日志记录（Redo Log Records）写入预写日志（Write-Ahead Log, WAL）**。每条重做日志记录本质上描述了数据页修改前后的状态差异，即“**前像（Before-image）**”与“**后像（After-image）**”之间的增量。通过将日志记录应用于数据页的前像，即可重新生成对应的后像。
+### 4.6 Page 是 log 应用结果，不是唯一真相
 
-在实际生产环境中，系统还必须处理其他数据的协同写入。例如，考虑一种跨数据中心实现高可用性（HA）的**同步镜像（Synchronous Mirrored）** MySQL 配置，其以图 2 所示的**主备模式（Active-Standby）**运行：
+在传统数据库里，持久化页面通常是数据的主要存在形式；redo log 用于恢复。在 Aurora 中，逻辑上更接近：redo log 是数据库，materialized page 是 redo log 应用后的缓存结果。
 
-- **活动实例（Active Instance）**：部署在可用区 AZ1，底层使用 Amazon Elastic Block Store (**EBS**) 网络存储。
-- **备用实例（Standby Instance）**：部署在可用区 AZ2，同样挂载 EBS 网络存储。
+这并不意味着 Aurora 每次读取都从头 replay。存储层会在后台持续物化页面，并且只对修改链较长的页面做 rematerialization。相比全局 checkpoint，这是一种更细粒度、更局部化的维护方式。
 
-在此架构下，所有对主 EBS 卷的写入操作都必须通过**软件镜像（Software Mirroring）**技术，同步至备用 EBS 卷。
+---
 
-![](../pic/aurora2.png)
+## 5. 实现架构：Aurora 是如何跑起来的
 
-<center>图 2：Network IO in mirrored MySQL</center>
+### 5.1 总体架构：把 logging + storage 移出数据库引擎
 
-图 2 展示了数据库引擎需要写入的多种数据类型：
+Aurora 的整体架构可以分为三部分：
 
-- **重做日志（Redo Log）**；
-- **二进制日志（Binary Log/Binlog）**：主要用于语句级（Statement）记录，并归档至 Amazon S3 以支持任意时间点恢复（Point-in-time Restores）；
-- **修改后的数据页**；
-- **双写（Double-write）**：为了防止页面断裂（Torn Pages）而对数据页进行的第二次临时性写入；
-- **元数据文件（FRM Files）**。
+- **数据库实例层**：writer instance 和 reader instances，负责 SQL、事务、锁、缓存、访问方法和并发控制；
+- **分布式存储层**：负责 redo log 持久化、quorum、page materialization、backup、repair、GC、scrub；
+- **控制面**：依托 RDS、Host Manager、DynamoDB、workflow 服务等完成健康监控、failover、实例替换、元数据管理和长任务编排。
 
-该图进一步揭示了实际 I/O 流的执行顺序：
+```mermaid
+flowchart LR
+    A[Customer application] --> W[Writer DB instance]
+    W -->|SQL / transactions / cache| W
+    W -->|redo log batches| S[Distributed storage service]
+    W -->|log + metadata stream| R[Reader DB instances]
+    S --> P[Protection Groups\n6 replicas across 3 AZs]
+    S --> B[S3 backup / restore]
+    HM[RDS Host Manager] --> W
+    CP[Control plane\nDynamoDB / workflow / monitoring] --> S
+```
 
-1. **步骤 1 与 2**：写入请求被下发至 **EBS**，EBS 继而将其同步至**可用区（AZ）本地镜像**；只有当两者均完成持久化后，系统才会收到确认（ACK）。
-2. **步骤 3**：通过同步块级软件镜像（Synchronous Block-level Software Mirroring），将写入操作传输至**备用实例（Standby Instance）**。
-3. **步骤 4 与 5**：数据最终被写入备用实例的 **EBS 卷**及其关联的镜像中。
+这个架构的核心不是“有主库和只读副本”，而是 writer、reader 和 storage fleet 之间共享同一个分布式存储卷。reader 不需要像传统 MySQL replica 那样重放完整复制链路并维护独立存储，而是利用共享存储和来自 writer 的事务元数据实现低延迟只读能力。
 
-上述 MySQL 镜像模型存在显著弊端，这不仅源于其**写入机制**，更取决于其**写入内容**。
+### 5.2 写路径：只把 redo log 写过网络
 
-首先，在该流程中，步骤 1、3 和 5 具有明显的串行性与同步性。由于大量写入操作必须按序执行，导致延迟呈现出**累加效应（Additive Latency）**。同时，由于即便在异步写入场景下，系统也必须等待执行最慢的操作完成才能返回，这使得**性能抖动（Jitter）**被显著放大，导致系统极易受“离群值”（Outliers，即慢节点请求）的影响而陷入瘫痪。从分布式系统的视角审视，该模型实质上可被视为执行了 **4/4 写 Quorum** 机制。这意味着系统在面对节点失效或长尾性能波动时表现得异常脆弱。其次，由 OLTP 应用引发的用户操作会产生多种不同类型的写入，而这些写入往往是对相同信息的重复表达——例如，为了防止存储基础设施层出现“页面断裂”（Torn Pages）而引入的**双写缓冲（Double Write Buffer）**操作，本质上就是对同一数据的冗余写入。
+Aurora 的写路径大致如下：
 
-### 3.3 Offloading Redo Processing to Storage
+1. SQL 执行导致数据库页面在 buffer cache 中被修改；
+2. InnoDB/Aurora 生成 redo log records，并按 LSN 排序；
+3. log records 按目标 Protection Group 分组、批量发送；
+4. 每个 batch 被发往该 PG 的 6 个 segment 副本；
+5. 6 个副本中至少 4 个持久化成功后，写 quorum 达成；
+6. 数据库推进 VDL；
+7. 当事务 commit LSN 不大于 VDL 时，事务被确认提交；
+8. reader instances 接收 log records 和事务元数据，用于更新缓存和支持只读事务。
 
+这条路径里最重要的设计是：数据库实例不会把 data page 写到网络存储。也就是说，没有因为 checkpoint、cache eviction 或 background flush 造成的页面网络写。前台写路径只关注 redo log。
 
+### 5.3 读路径：正常情况下避免 read quorum
 
+Aurora 并不是每次读取都向 3 个副本发请求并做 quorum read。数据库实例维护运行时状态，知道哪些 segment 对当前 read point 是完整的。读取页面时，它可以选择一个满足 read point 的 storage node 直接读取。
+
+read quorum 主要用于恢复场景：当数据库崩溃或运行时状态丢失后，系统需要重新联系每个 PG 的 read quorum，以发现所有可能已经达到 write quorum 的日志，并据此重建 VDL。
+
+这个设计非常关键。它说明 Aurora 虽然使用 quorum 提供持久性和故障容忍，但没有把 quorum 成本平均摊到每一次普通读上。
+
+### 5.4 存储节点流水线：前台只做必要动作
+
+Aurora storage node 对 log record 的处理是一条异步流水线：
+
+1. 接收 log record，放入内存队列；
+2. 将 record 持久化到本地磁盘，并向数据库实例 ACK；
+3. 整理日志并识别缺口；
+4. 与同一 PG 的 peer storage nodes gossip，补齐缺口；
+5. 合并 log records，生成新的 data page versions；
+6. 周期性把 log 和 page versions 备份到 S3；
+7. 周期性垃圾回收旧版本；
+8. 周期性校验页面 CRC。
+
+其中只有前两步在前台写路径中直接影响提交延迟。其余工作都被后台化、异步化，并且可以在存储节点空闲时执行。
+
+这就是 Aurora 降低抖动的核心：传统数据库的 checkpoint、刷脏、备份通常与前台负载正相关；Aurora 则试图让后台工作与前台压力负相关，在存储节点繁忙时延后 GC、page materialization 等非关键操作。
+
+### 5.5 Quorum 与故障容忍
+
+Aurora 的基础复制模型是：每个数据项 6 份，跨 3 个 AZ，每个 AZ 2 份。写 quorum 为 4/6，读 quorum 为 3/6。
+
+这个模型满足两个条件：
+
+- `Vr + Vw > V`，即读 quorum 和写 quorum 必然相交；
+- `Vw > V/2`，即不同写 quorum 必然相交。
+
+在设计目标上，Aurora 希望做到：
+
+- 丢失一个 AZ 再额外丢失一个节点时，仍不丢数据；
+- 丢失一个 AZ 时，不影响写入能力；
+- 丢失任意两个节点时，仍能维持写 quorum；
+- 保持 read quorum 后，可以通过新建副本恢复 write quorum。
+
+这种模型专门针对云环境中的 correlated failure 设计，而不是只针对单盘或单机故障。
+
+### 5.6 崩溃恢复：重建运行时状态，而不是重放全部 redo
+
+传统数据库崩溃后，通常需要从 checkpoint 开始 replay redo log，再回滚未提交事务。Aurora 不再依赖启动时的集中式 redo replay，因为 redo apply 已经在存储层持续发生。
+
+数据库实例重启时，需要做的是：
+
+- 对每个 PG 联系 read quorum；
+- 找出可能达到 write quorum 的最高日志边界；
+- 重建 VDL；
+- 截断 VDL 之后不应保留的 log records；
+- 在线执行 undo recovery，回滚崩溃时未完成的事务。
+
+论文给出的结果是，即使系统崩溃时处理超过 100,000 write statements/sec，Aurora 通常也可以在 10 秒内完成 volume recovery。未提交事务的 undo recovery 可以在数据库重新上线后继续执行。
+
+### 5.7 备份与恢复：持续备份，而不是停顿式快照
+
+Aurora storage node 会周期性将 log 和 page versions 备份到 S3。由于存储层天然维护 redo stream 和 page versions，备份恢复可以与前台处理解耦，而不需要数据库实例像传统系统那样为备份产生大量额外页面 I/O。
+
+这也解释了 Aurora 为什么把 backup/restore 放在存储服务侧：备份不是数据库实例的偶发重负载，而是存储层持续进行的后台服务。
+
+### 5.8 控制面：RDS、Host Manager、DynamoDB、Workflow
+
+Aurora 使用 RDS 作为控制面。每个数据库实例上有 Host Manager，用于监控 cluster 健康，判断是否需要 failover 或替换实例。存储控制面保存 volume 配置、元数据、备份描述等信息，并编排 restore、repair、re-replication 等长任务。
+
+这说明 Aurora 不是一个单进程数据库，而是一套云数据库服务。其可靠性来自数据库内核、存储 quorum、控制面编排、监控告警和后台修复共同组成的系统。
+
+---
+
+## 6. 性能与规模：Aurora 为什么能支撑云上 OLTP
+
+Aurora 的性能收益主要来自两个方向：减少数据库实例侧网络 I/O，以及把存储层 I/O 并行化、后台化。
+
+### 6.1 网络 I/O：Aurora 与 mirrored MySQL
+
+论文使用 100GB 数据集、SysBench write-only workload，对比 mirrored MySQL 和 Aurora with replicas。测试持续 30 分钟，实例为 r3.8xlarge。
+
+| 配置 | Transactions | IOs / Transaction |
+|---|---:|---:|
+| Mirrored MySQL | 780,000 | 7.4 |
+| Aurora with Replicas | 27,378,000 | 0.95 |
+
+论文结论是：Aurora 在 30 分钟内支撑的事务数约为 mirrored MySQL 的 35 倍；数据库节点每事务 I/O 数约少 7.7 倍；考虑到每个 storage node 只处理 6 副本中的一份，存储层需要处理的 I/O 进一步显著减少。
+
+这里的重点不是单个数字，而是方法论：Aurora 先减少过网对象，再让存储服务横向扩展。
+
+### 6.2 数据规模变化下的写吞吐
+
+SysBench write-only 结果如下：
+
+| DB Size | Amazon Aurora writes/sec | MySQL writes/sec |
+|---|---:|---:|
+| 1 GB | 107,000 | 8,400 |
+| 10 GB | 107,000 | 2,400 |
+| 100 GB | 101,000 | 1,500 |
+| 1 TB | 41,000 | 1,200 |
+
+在 100GB 数据集上，Aurora 相对 MySQL 最高达到约 67 倍；即使在 1TB、out-of-cache 工作负载下，Aurora 仍达到约 34 倍。
+
+### 6.3 连接数增长下的吞吐
+
+SysBench OLTP 在不同连接数下的写吞吐如下：
+
+| Connections | Amazon Aurora writes/sec | MySQL writes/sec |
+|---:|---:|---:|
+| 50 | 40,000 | 10,000 |
+| 500 | 71,000 | 21,000 |
+| 5,000 | 110,000 | 13,000 |
+
+MySQL 在连接数上升后吞吐出现峰值后回落；Aurora 则继续扩展到更高写吞吐。这对 SaaS、多租户、大量短连接或突发连接场景非常重要。
+
+### 6.4 Replica lag
+
+SysBench write-only 场景下，Aurora replica lag 与 MySQL replica lag 对比如下：
+
+| Writes/sec | Aurora replica lag | MySQL replica lag |
+|---:|---:|---:|
+| 1,000 | 2.62 ms | < 1000 ms |
+| 2,000 | 3.42 ms | 1000 ms |
+| 5,000 | 3.94 ms | 60,000 ms |
+| 10,000 | 5.38 ms | 300,000 ms |
+
+Aurora 的 reader 不像传统 MySQL replica 那样依赖独立存储复制和长链路 replay，因此在高写入压力下仍能保持非常低的副本延迟。
+
+### 6.5 热点行竞争与 TPC-C 变体
+
+Percona TPC-C variant 结果如下：
+
+| Connections / Size / Warehouses | Amazon Aurora tpmC | MySQL 5.6 tpmC | MySQL 5.7 tpmC |
+|---|---:|---:|---:|
+| 500 / 10GB / 100 | 73,955 | 6,093 | 25,289 |
+| 5000 / 10GB / 100 | 42,181 | 1,671 | 2,592 |
+| 500 / 100GB / 1000 | 70,663 | 3,231 | 11,868 |
+| 5000 / 100GB / 1000 | 30,221 | 5,575 | 13,005 |
+
+这说明 Aurora 的收益不仅来自纯顺序写或简单 benchmark，也能体现在存在热点行竞争、连接数高、数据集较大的 OLTP 场景中。
+
+### 6.6 真实客户工作负载
+
+论文中给出两个迁移案例：
+
+- 一个互联网游戏公司从 MySQL 迁移到 Aurora 后，web transaction 平均响应时间从 15ms 降到 5.5ms，约 3 倍改善；
+- 一个教育科技公司迁移后，SELECT 和 per-record INSERT 的 P95 latency 明显改善，接近 P50；同时，原本 MySQL replica lag 可飙升到 12 分钟，迁移 Aurora 后 4 个 replica 的最大 lag 未超过 20ms。
+
+这些案例说明 Aurora 的价值不只在平均吞吐，也在降低长尾、降低副本延迟和提升读扩展可用性。
+
+---
+
+## 7. 典型应用场景：Aurora 在云数据库里到底怎么用
+
+### 7.1 SaaS 多租户与数据库整合
+
+很多 SaaS 公司会把不同客户放在同一个数据库实例中，常见方式是以 schema 或 database 作为租户单位，而不是像 Salesforce 那样把所有租户数据放到统一表结构中。这会导致一个实例中有大量 schema、table 和 metadata。
+
+论文提到，某些 SaaS 客户有超过 50,000 个自己的客户；生产实例中超过 150,000 张表并不少见。这类场景需要：
+
+- 高连接数能力；
+- 高吞吐；
+- 按实际使用量增长的存储；
+- 单个租户流量尖峰不显著干扰其他租户；
+- 较低的尾延迟和副本延迟。
+
+Aurora 的分布式存储和低 I/O 放大使它很适合这类整合型云数据库负载。
+
+### 7.2 高并发与突发流量
+
+互联网业务经常遇到不可预测的流量峰值，例如营销活动、热点事件、电视节目曝光等。Aurora 的客户案例显示，部分客户可以运行在每秒 8000 以上连接请求的级别。
+
+Aurora 在这类场景中的优势包括：
+
+- 存储容量无需提前一次性规划；
+- reader 可以承接读流量；
+- writer 写路径减少网络 I/O；
+- 存储节点慢点可以被 quorum 吸收；
+- 后台任务可以避让前台高峰。
+
+### 7.3 读扩展与低 replica lag
+
+传统 MySQL replica lag 会让只读副本在高写压力场景下只能作为 standby，而不适合承接实时查询。Aurora 通过共享存储和 writer 到 reader 的事务元数据流，显著降低 read replica lag。
+
+这使应用可以把更多 SELECT 查询导向 reader，在降低 writer 压力的同时提高整体可用性。
+
+### 7.4 频繁 schema evolution
+
+现代 Web 应用框架和 ORM 让开发者更频繁地做 schema migration。传统 MySQL 对许多 DDL 操作使用 full table copy，会给 DBA 带来明显运维压力。
+
+Aurora 论文中提到，它实现了更高效的 online DDL：以 page 为粒度维护 schema version，需要时按历史 schema 解码页面，并通过 modify-on-write 懒惰升级页面。这种设计适合频繁 DDL 的云应用开发节奏。
+
+### 7.5 高可用维护与软件升级
+
+托管数据库服务需要频繁修补软件，但客户对 OLTP 中断非常敏感。Aurora 论文中提到 Zero-Downtime Patching（ZDP）：系统寻找没有活跃事务的瞬间，把 application state spool 到本地临时存储，patch engine 后再 reload state，使用户连接保持活跃。
+
+这类能力体现了 Aurora 与传统数据库产品的区别：它不仅是数据库内核优化，也是服务运维能力的产品化。
+
+### 7.6 Serverless 与弹性容量
+
+从今天的 AWS 产品形态看，Aurora Serverless v2 把 Aurora 的云原生思想进一步推到 compute capacity 层：数据库容量可以随 workload 自动扩缩，适合变量负载、多租户、开发测试和不可预测峰值应用。它不是论文中的核心设计，但延续了同一个方向：把数据库的容量规划和运维动作尽可能服务化、自动化。
+
+---
+
+## 8. 优势与局限：应该怎样评价 Aurora
+
+### 8.1 主要优势
+
+**第一，网络 I/O 模型非常克制。** Aurora 只把 redo log 写过网络，不从数据库实例写出 data page，从根本上减少了高可用复制环境里的 I/O 放大。
+
+**第二，存储层具备数据库语义。** 它不是普通远端磁盘，而是理解 redo、LSN、page version、PG、quorum、repair 和 backup 的数据库专用分布式存储服务。
+
+**第三，故障模型面向云规模。** 6 副本、3 AZ、4/6 write quorum、3/6 read quorum 的设计专门处理 AZ 级相关故障和持续存在的背景故障。
+
+**第四，恢复时间短。** 由于 redo apply 持续在存储层后台进行，崩溃恢复不再需要数据库启动时集中 replay 大量日志。
+
+**第五，兼容性与架构创新结合。** Aurora 没有完全抛弃 MySQL/InnoDB 生态，而是在保留上层数据库语义的同时重构底层 logging/storage/recovery。
+
+**第六，平台化运维能力强。** 自动修复、持续备份、读副本、failover、online DDL、ZDP、控制面编排等能力，使 Aurora 更像一个数据库服务平台，而不只是一个数据库二进制。
+
+### 8.2 主要局限
+
+**第一，论文架构的写入仍以 single writer 为中心。** Aurora 通过分布式存储扩展持久化能力和读能力，但写事务仍由单个 writer 生成有序 LSN。这简化了一致性和恢复，但也意味着写扩展不是任意多主横向扩展。
+
+**第二，复杂性从数据库实例转移到存储服务和控制面。** 应用看到的接口更简单，但系统内部需要维护 quorum、gossip、VDL、repair、backup、metadata、failover 和监控。复杂性没有消失，只是被云服务团队集中承担。
+
+**第三，网络仍然是根本约束。** Aurora 减少了网络 I/O，但并没有消除网络依赖。如果存储层或网络跟不上，系统仍需要通过 LSN allocation limit 等机制对写入施加 back-pressure。
+
+**第四，6 副本不是免费的。** Aurora 通过 redo-only 写降低 I/O 放大，但高可用和高持久性仍然需要多副本、跨 AZ 网络、存储节点和后台修复成本。
+
+**第五，兼容不等于完全等同。** Aurora 保持 MySQL/PostgreSQL 兼容接口，但底层存储、备份、恢复、复制、某些参数和某些运维行为与自建数据库不同。依赖底层引擎细节、插件、特殊复制语义或非常规运维流程的应用，迁移前仍需要验证。
+
+**第六，它不是 Spanner 类全球强一致数据库。** Aurora 论文中的核心模型是 region 内的单 writer cluster 和跨 AZ storage quorum；它并不试图提供 Spanner 那种全球外部一致性事务模型。
+
+---
+
+## 9. 今天再看 Aurora：它留下了什么方法论
+
+Aurora 的影响不只在 AWS 产品本身。它代表了一类云原生关系数据库方法论：**把关系数据库中最适合分布式化的 logging、storage、backup、recovery 拆出来，做成数据库感知的 scale-out storage service，同时尽量保留 SQL 层和事务层的兼容性。**
+
+今天再看 Aurora，可以总结出几条仍然有效的方法论。
+
+### 9.1 云数据库的核心不是“托管”，而是架构重写
+
+把数据库进程放到云主机上，最多只是 hosted database。Aurora 的关键是重写了数据库与存储的交互方式，使存储服务理解数据库日志，并承担恢复、备份、修复和复制。
+
+### 9.2 分布式系统设计要围绕故障相关性
+
+单点故障模型不足以解释云规模系统。Aurora 的 quorum 设计显式考虑 AZ failure 与后台独立故障的叠加，这比“复制三份就够了”的模型更贴近现实。
+
+### 9.3 降低前台路径比优化后台路径更重要
+
+Aurora 并没有让所有工作消失，而是把能后台化的工作后台化：page materialization、GC、scrub、backup、repair 都尽量不进入事务提交路径。前台路径只做必要的日志持久化和 ACK。
+
+### 9.4 数据库兼容性是架构创新的约束条件
+
+完全新设计的数据库可以更激进，但迁移成本更高。Aurora 的商业价值部分来自它对 MySQL/PostgreSQL 生态的兼容，使现有 OLTP 应用能获得云原生存储收益，而不是重写业务。
+
+### 9.5 弹性从 storage 继续扩展到 compute
+
+当前 Aurora 已不仅仅是论文时期的 MySQL-compatible storage architecture。AWS 文档中，Aurora 提供 MySQL/PostgreSQL 兼容引擎、自动增长的高性能分布式存储、跨 AZ 复制、最多 15 个 read replicas，以及 Aurora Serverless v2 这类按需自动扩缩 compute capacity 的能力。某些 Aurora PostgreSQL 版本还把最大集群存储容量提升到 256 TiB。
+
+换句话说，Aurora 后来的产品演进仍然沿着同一条线走：把数据库中原本需要人工规划、停机操作或专门 DBA 处理的部分，逐步变成云服务自动完成的控制面能力。
+
+---
+
+## 10. 总结
+
+Aurora 的经典之处不在于“它比 MySQL 快多少倍”这个表层结果，而在于它证明了三件事：
+
+1. **云上 OLTP 的主要瓶颈可以通过重构数据库-存储边界来缓解。**
+2. **redo log 可以成为连接事务语义、分布式存储、快速恢复和持续备份的核心抽象。**
+3. **关系数据库可以在保持应用兼容性的同时，获得云原生的可用性、弹性和运维能力。**
+
+如果要用一句话概括 Aurora，可以这样说：
+
+**Aurora 不是“托管版 MySQL/PostgreSQL”，而是把关系数据库的日志、存储、恢复和复制重构为云原生分布式服务的数据库系统。**
+
+---
+
+## 参考资料
+
+- Alexandre Verbitski et al., *Amazon Aurora: Design Considerations for High Throughput Cloud-Native Relational Databases*, SIGMOD 2017.
+- Amazon Science, *Amazon Aurora: Design considerations for high throughput cloud-native relational databases*.
+- AWS Documentation, *What is Amazon Aurora?*
+- AWS Documentation, *Amazon Aurora storage*.
+- AWS Documentation, *High availability for Amazon Aurora*.
+- AWS Documentation, *Using Aurora Serverless v2*.
